@@ -1,0 +1,28 @@
+# Credentials and secrets
+.credentials.json
+*.key
+*.pem
+*.p12
+*.pfx
+*secret*
+*credential*
+
+# User-specific data
+history.jsonl
+file-history/
+shell-snapshots/
+session-env/
+todos/
+config/notification_states.json
+ide/
+plugins/
+
+# Build artifacts and caches
+.search-index/
+debug/
+
+# Project-specific data (contains user's project paths)
+projects/
+
+# Statistics and telemetry
+statsig/

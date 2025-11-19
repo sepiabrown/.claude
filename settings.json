@@ -1,0 +1,23 @@
+{
+  "env": {
+    "MCP_TOOL_TIMEOUT": "7200000"
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ~/.claude/hooks/cursor-delegation-reminder.sh"
+          }
+        ]
+      }
+    ]
+  },
+  "enabledPlugins": {
+    "document-skills@anthropic-agent-skills": false,
+    "example-skills@anthropic-agent-skills": false
+  },
+  "alwaysThinkingEnabled": true
+}
