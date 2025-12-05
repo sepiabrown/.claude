@@ -1,0 +1,370 @@
+#!/usr/bin/env bash
+# opencode-view-conversation - Extract and view OpenCode conversation history
+# Usage: opencode-view-conversation [session-id|file] [-o output.txt]
+#
+# NOTE: OpenCode stores full message content in the 'part' directory.
+# - Message parts contain actual user input and assistant responses
+# - Summaries are also available in the message metadata
+
+set -euo pipefail
+
+OPENCODE_STORAGE_DIR="$HOME/.local/share/opencode/storage"
+OPENCODE_SESSION_DIR="$OPENCODE_STORAGE_DIR/session"
+OPENCODE_MESSAGE_DIR="$OPENCODE_STORAGE_DIR/message"
+OPENCODE_PROJECT_DIR="$OPENCODE_STORAGE_DIR/project"
+OPENCODE_PART_DIR="$OPENCODE_STORAGE_DIR/part"
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+NC='\033[0m' # No Color
+
+# Help text
+show_help() {
+    cat << EOF
+${GREEN}opencode-view-conversation${NC} - View OpenCode conversation history
+
+${YELLOW}Usage:${NC}
+    opencode-view-conversation [OPTIONS] [SESSION_ID]
+
+${YELLOW}Options:${NC}
+    -o FILE          Save output to FILE instead of viewing in less
+    -l               List all available conversations
+    -p PROJECT       Filter conversations by project directory
+    -s               Show summary mode (summaries instead of full content)
+    -t               Show tool calls and results
+    -h, --help       Show this help message
+
+${YELLOW}Examples:${NC}
+    # List all conversations
+    opencode-view-conversation -l
+
+    # View a specific conversation
+    opencode-view-conversation ses_527eefd14ffezmZNI1b5AjHPYk
+
+    # View by partial session ID (prefix matching)
+    opencode-view-conversation ses_527ee
+
+    # Save to file
+    opencode-view-conversation ses_527eefd14ffezmZNI1b5AjHPYk -o conversation.txt
+
+    # List conversations for specific project
+    opencode-view-conversation -l -p DiOodMi
+
+    # Show summary mode
+    opencode-view-conversation -s ses_527eefd14ffezmZNI1b5AjHPYk
+
+    # Show with tool calls
+    opencode-view-conversation -t ses_527eefd14ffezmZNI1b5AjHPYk
+
+${YELLOW}Note:${NC}
+    By default, shows full conversation content from message parts.
+    Sessions are stored in: $OPENCODE_STORAGE_DIR
+EOF
+}
+
+# Convert timestamp to human-readable format
+timestamp_to_date() {
+    local ts="$1"
+    # Timestamp is in milliseconds, convert to seconds
+    local ts_sec=$((ts / 1000))
+    date -d "@$ts_sec" "+%Y-%m-%d %H:%M:%S" 2>/dev/null || date -r "$ts_sec" "+%Y-%m-%d %H:%M:%S" 2>/dev/null || echo "unknown"
+}
+
+# Get project name from project ID
+get_project_name() {
+    local project_id="$1"
+    local project_file="$OPENCODE_PROJECT_DIR/${project_id}.json"
+    
+    if [ -f "$project_file" ]; then
+        local worktree=$(jq -r '.worktree // "unknown"' "$project_file" 2>/dev/null)
+        basename "$worktree"
+    else
+        echo "$project_id"
+    fi
+}
+
+# List available conversations
+list_conversations() {
+    local project_filter="${1:-}"
+
+    echo -e "${GREEN}Available OpenCode conversations:${NC}\n"
+
+    # Find all session files in both global and project directories
+    find "$OPENCODE_SESSION_DIR" -name "ses_*.json" -type f -printf "%T@ %p\n" 2>/dev/null | sort -rn | cut -d' ' -f2- | while read -r session_file; do
+        local session_id=$(basename "$session_file" .json)
+        local project_id=$(jq -r '.projectID // "unknown"' "$session_file" 2>/dev/null)
+        local project_name=$(get_project_name "$project_id")
+        local title=$(jq -r '.title // "Untitled"' "$session_file" 2>/dev/null)
+        local directory=$(jq -r '.directory // "unknown"' "$session_file" 2>/dev/null)
+        local created=$(jq -r '.time.created // 0' "$session_file" 2>/dev/null)
+        local updated=$(jq -r '.time.updated // 0' "$session_file" 2>/dev/null)
+        local version=$(jq -r '.version // "unknown"' "$session_file" 2>/dev/null)
+        
+        # Apply filter if specified
+        if [ -n "$project_filter" ] && [[ ! "$project_name" =~ $project_filter ]] && [[ ! "$directory" =~ $project_filter ]]; then
+            continue
+        fi
+
+        # Count messages for this session
+        local msg_count=0
+        if [ -d "$OPENCODE_MESSAGE_DIR/$session_id" ]; then
+            msg_count=$(find "$OPENCODE_MESSAGE_DIR/$session_id" -name "msg_*.json" -type f 2>/dev/null | wc -l)
+        fi
+
+        # Format timestamps
+        local created_date=$(timestamp_to_date "$created")
+        local updated_date=$(timestamp_to_date "$updated")
+
+        # Short session ID for display
+        local short_id="${session_id:0:20}"
+
+        echo -e "${BLUE}Project: ${project_name}${NC} ${CYAN}(${project_id})${NC}"
+        echo -e "  ${YELLOW}${short_id}${NC}..."
+        echo -e "    Title: ${title}"
+        echo -e "    Directory: ${directory}"
+        echo -e "    Created: ${created_date}"
+        echo -e "    Updated: ${updated_date}"
+        echo -e "    Messages: ${msg_count}"
+        echo -e "    Version: ${version}"
+        echo ""
+    done
+}
+
+# Extract conversation text from messages
+extract_conversation() {
+    local session_id="$1"
+    local summary_mode="${2:-false}"
+    local show_tools="${3:-false}"
+    local message_dir="$OPENCODE_MESSAGE_DIR/$session_id"
+
+    if [ ! -d "$message_dir" ]; then
+        echo -e "${RED}Error: No messages found for session: $session_id${NC}" >&2
+        return 1
+    fi
+
+    # Read session metadata
+    local session_file=$(find "$OPENCODE_SESSION_DIR" -name "${session_id}.json" -type f 2>/dev/null | head -1)
+    if [ -f "$session_file" ]; then
+        echo "================================================================================"
+        echo " SESSION METADATA"
+        echo "================================================================================"
+        echo "Session ID: $session_id"
+        jq -r '
+            "Title: " + (.title // "Untitled") + "\n" +
+            "Project: " + (.projectID // "unknown") + "\n" +
+            "Directory: " + (.directory // "unknown") + "\n" +
+            "Version: " + (.version // "unknown") + "\n" +
+            "Created: " + (if .time.created then (.time.created / 1000 | todate) else "unknown" end) + "\n" +
+            "Updated: " + (if .time.updated then (.time.updated / 1000 | todate) else "unknown" end)
+        ' "$session_file" 2>/dev/null || echo "Error reading session metadata"
+        echo ""
+    fi
+
+    echo "================================================================================"
+    echo " CONVERSATION"
+    echo "================================================================================"
+    echo ""
+
+    # Find and sort message files by creation time
+    find "$message_dir" -name "msg_*.json" -type f 2>/dev/null | while read -r msg_file; do
+        echo "$msg_file" "$(jq -r '.time.created // 0' "$msg_file" 2>/dev/null)"
+    done | sort -k2 -n | cut -d' ' -f1 | while read -r msg_file; do
+        local msg_id=$(basename "$msg_file" .json)
+        local role=$(jq -r '.role // "unknown"' "$msg_file" 2>/dev/null)
+        local created=$(jq -r '.time.created // 0' "$msg_file" 2>/dev/null)
+        local created_date=$(timestamp_to_date "$created")
+        
+        echo "================================================================================"
+        echo " ${role^^} - ${created_date}"
+        echo "================================================================================"
+        
+        # Extract message content based on mode
+        if [ "$summary_mode" = "true" ]; then
+            # Summary mode - use message metadata
+            if [ "$role" = "user" ]; then
+                echo -n "Input: "
+                jq -r '.summary.title // "(no summary)"' "$msg_file" 2>/dev/null
+            elif [ "$role" = "assistant" ]; then
+                local model=$(jq -r '.modelID // "unknown"' "$msg_file" 2>/dev/null)
+                local provider=$(jq -r '.providerID // "unknown"' "$msg_file" 2>/dev/null)
+                echo "Model: ${provider}/${model}"
+                jq -r 'if .summary.title then "Summary: " + .summary.title else "" end' "$msg_file" 2>/dev/null
+                jq -r 'if .summary.body then .summary.body else "" end' "$msg_file" 2>/dev/null
+            fi
+        else
+            # Full mode - read from part directory
+            local part_dir="$OPENCODE_PART_DIR/$msg_id"
+            
+            if [ -d "$part_dir" ]; then
+                # Find and sort parts by filename (they are ordered)
+                find "$part_dir" -name "prt_*.json" -type f 2>/dev/null | sort | while read -r part_file; do
+                    local part_type=$(jq -r '.type // "unknown"' "$part_file" 2>/dev/null)
+                    
+                    case "$part_type" in
+                        text)
+                            # Display text content
+                            jq -r '.text // ""' "$part_file" 2>/dev/null
+                            echo ""
+                            ;;
+                        tool)
+                            if [ "$show_tools" = "true" ]; then
+                                local tool_name=$(jq -r '.tool // "unknown"' "$part_file" 2>/dev/null)
+                                local tool_status=$(jq -r '.state.status // "unknown"' "$part_file" 2>/dev/null)
+                                
+                                echo "[TOOL: $tool_name - $tool_status]"
+                                jq -r '.state.input | to_entries | map("  " + .key + ": " + (.value | tostring)) | join("\n")' "$part_file" 2>/dev/null
+                                
+                                if [ "$tool_status" = "completed" ]; then
+                                    local output=$(jq -r '.state.output // ""' "$part_file" 2>/dev/null)
+                                    if [ -n "$output" ] && [ "$output" != "null" ]; then
+                                        echo "Output:"
+                                        echo "$output" | head -20
+                                        local line_count=$(echo "$output" | wc -l)
+                                        if [ "$line_count" -gt 20 ]; then
+                                            echo "... (${line_count} lines total, showing first 20)"
+                                        fi
+                                    fi
+                                fi
+                                echo ""
+                            fi
+                            ;;
+                        step-start|step-end|step-finish)
+                            # Skip step markers
+                            ;;
+                        *)
+                            # Unknown part type - skip silently
+                            ;;
+                    esac
+                done
+            else
+                # Fallback to summary if no parts available
+                if [ "$role" = "user" ]; then
+                    jq -r '.summary.title // "(no content)"' "$msg_file" 2>/dev/null
+                elif [ "$role" = "assistant" ]; then
+                    jq -r '.summary.body // "(no content)"' "$msg_file" 2>/dev/null
+                fi
+            fi
+        fi
+        
+        echo ""
+    done
+}
+
+# Find conversation session by ID (supports partial hash)
+find_session() {
+    local session_id="$1"
+
+    # Try exact match first
+    local exact_match=$(find "$OPENCODE_SESSION_DIR" -name "${session_id}.json" -type f 2>/dev/null | head -1)
+    
+    if [ -n "$exact_match" ]; then
+        basename "$exact_match" .json
+        return 0
+    fi
+
+    # Try partial hash match (prefix matching)
+    local matches=$(find "$OPENCODE_SESSION_DIR" -name "${session_id}*.json" -type f 2>/dev/null)
+    local match_count=$(echo "$matches" | grep -c "^" 2>/dev/null || echo 0)
+
+    if [ "$match_count" -eq 1 ]; then
+        basename "$matches" .json
+        return 0
+    elif [ "$match_count" -gt 1 ]; then
+        echo -e "${RED}Error: Ambiguous session ID '$session_id' - multiple matches found:${NC}" >&2
+        echo "$matches" | while read -r file; do
+            local full_id=$(basename "$file" .json)
+            echo -e "  ${YELLOW}${full_id}${NC}" >&2
+        done
+        echo -e "${YELLOW}Tip: Use more characters to uniquely identify the session${NC}" >&2
+        return 1
+    fi
+
+    echo -e "${RED}Error: Session ID '$session_id' not found${NC}" >&2
+    echo -e "${YELLOW}Tip: Run 'opencode-view-conversation -l' to see available conversations${NC}" >&2
+    return 1
+}
+
+# Main script
+main() {
+    local output_file=""
+    local session_id=""
+    local list_mode=false
+    local project_filter=""
+    local summary_mode=false
+    local show_tools=false
+
+    # Parse arguments
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help)
+                show_help
+                exit 0
+                ;;
+            -l)
+                list_mode=true
+                shift
+                ;;
+            -p)
+                project_filter="$2"
+                shift 2
+                ;;
+            -o)
+                output_file="$2"
+                shift 2
+                ;;
+            -s)
+                summary_mode=true
+                shift
+                ;;
+            -t)
+                show_tools=true
+                shift
+                ;;
+            -*)
+                echo -e "${RED}Error: Unknown option: $1${NC}" >&2
+                show_help
+                exit 1
+                ;;
+            *)
+                session_id="$1"
+                shift
+                ;;
+        esac
+    done
+
+    # List mode
+    if [ "$list_mode" = true ]; then
+        list_conversations "$project_filter"
+        exit 0
+    fi
+
+    # Need a session ID
+    if [ -z "$session_id" ]; then
+        echo -e "${RED}Error: No session ID specified${NC}" >&2
+        echo ""
+        show_help
+        exit 1
+    fi
+
+    # Find the session
+    local found_session
+    found_session=$(find_session "$session_id") || exit 1
+
+    echo -e "${GREEN}Reading conversation:${NC} $found_session" >&2
+    echo ""
+
+    # Extract and display/save
+    if [ -n "$output_file" ]; then
+        extract_conversation "$found_session" "$summary_mode" "$show_tools" > "$output_file"
+        echo -e "${GREEN}Saved to:${NC} $output_file" >&2
+        echo -e "${BLUE}Size:${NC} $(du -h "$output_file" | cut -f1)" >&2
+    else
+        extract_conversation "$found_session" "$summary_mode" "$show_tools" | less -R
+    fi
+}
+
+main "$@"

@@ -1,0 +1,276 @@
+#!/usr/bin/env bash
+# claude-view-conversation - Extract and view Claude Code conversation history
+# Usage: claude-view-conversation [session-id|file] [-o output.txt]
+
+set -euo pipefail
+
+CLAUDE_PROJECTS_DIR="$HOME/.claude/projects"
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Help text
+show_help() {
+    cat << EOF
+${GREEN}claude-view-conversation${NC} - View Claude Code conversation history
+
+${YELLOW}Usage:${NC}
+    claude-view-conversation [OPTIONS] [SESSION_ID|FILE]
+
+${YELLOW}Options:${NC}
+    -o FILE          Save output to FILE instead of viewing in less
+    -l               List all available conversations
+    -p PROJECT       Filter conversations by project directory
+    -h, --help       Show this help message
+
+${YELLOW}Examples:${NC}
+    # List all conversations
+    claude-view-conversation -l
+
+    # View a specific conversation (auto-detects current project)
+    claude-view-conversation 1f0ba43f-8872-4b32-810a-566872e3c333
+
+    # View by full path
+    claude-view-conversation ~/.claude/projects/-home-suwonp/some-session.jsonl
+
+    # Save to file
+    claude-view-conversation 1f0ba43f-8872-4b32-810a-566872e3c333 -o conversation.txt
+
+    # List conversations for specific project
+    claude-view-conversation -l -p image-enhancer
+
+${YELLOW}Note:${NC}
+    Session IDs can be found by running: claude-code --resume
+    Or in: ~/.claude/projects/
+EOF
+}
+
+# List available conversations
+list_conversations() {
+    local project_filter="${1:-}"
+
+    echo -e "${GREEN}Available conversations:${NC}\n"
+
+    for project_dir in "$CLAUDE_PROJECTS_DIR"/*; do
+        if [ ! -d "$project_dir" ]; then
+            continue
+        fi
+
+        local project_name=$(basename "$project_dir")
+
+        # Apply filter if specified
+        if [ -n "$project_filter" ] && [[ ! "$project_name" =~ $project_filter ]]; then
+            continue
+        fi
+
+        echo -e "${BLUE}Project: $project_name${NC}"
+
+        # Find conversation files (exclude agent files), sort by modification time
+        find "$project_dir" -maxdepth 1 -name "*.jsonl" ! -name "agent-*" -type f -printf "%T@ %p\n" 2>/dev/null | sort -rn | cut -d' ' -f2- | while read -r file; do
+            local session_id=$(basename "$file" .jsonl)
+            local short_id="${session_id:0:8}"
+            local size=$(du -h "$file" | cut -f1)
+            local timestamp=$(stat -c "%y" "$file" 2>/dev/null | cut -d'.' -f1 || stat -f "%Sm" -t "%Y-%m-%d %H:%M:%S" "$file" 2>/dev/null || echo "unknown")
+            local msg_count=$(wc -l < "$file")
+
+            # Extract first user message as title (skip meta and command messages)
+            local title=$(cat "$file" | jq -r 'select(.type == "user" and (.isMeta | not)) | .message.content | if type == "string" then . else empty end' 2>/dev/null | head -1 | cut -c1-80)
+
+            # Clean up title (remove newlines and extra spaces)
+            title=$(echo "$title" | tr '\n' ' ' | sed 's/  */ /g' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+
+            # If no title found, use placeholder
+            if [ -z "$title" ]; then
+                title="(no title)"
+            fi
+
+            echo -e "  ${YELLOW}${short_id}${NC}... - ${timestamp} - ${size} - ${msg_count} msgs"
+            echo -e "    \"${title}\""
+        done
+        echo ""
+    done
+}
+
+# Extract conversation text with tool calls
+extract_conversation() {
+    local input_file="$1"
+
+    if [ ! -f "$input_file" ]; then
+        echo -e "${RED}Error: File not found: $input_file${NC}" >&2
+        return 1
+    fi
+
+    cat "$input_file" | jq -r '
+        select(.type == "user" or .type == "assistant") |
+        select(.isMeta | not) |
+        "\n" + ("="*80) + "\n " + (.type | ascii_upcase) +
+        "\n" + ("="*80) + "\n" +
+        (
+            if (.message.content | type) == "string" then
+                # Content is a string (simple user message)
+                .message.content
+            else
+                # Content is an array (complex message with tools)
+                [
+                    .message.content[]? |
+                    if .type == "text" then
+                        .text
+                    elif .type == "tool_use" then
+                        "\n[TOOL: " + .name + "]\n" +
+                        if .name == "Bash" then
+                            "Command: " + (.input.command // "N/A") + "\n" +
+                            if .input.description then "Description: " + .input.description else "" end
+                        elif .name == "Read" then
+                            "File: " + (.input.file_path // "N/A") +
+                            if .input.offset then " (offset: " + (.input.offset | tostring) + ", limit: " + (.input.limit | tostring) + ")" else "" end
+                        elif .name == "Edit" then
+                            "File: " + (.input.file_path // "N/A")
+                        elif .name == "Write" then
+                            "File: " + (.input.file_path // "N/A")
+                        elif .name == "Grep" then
+                            "Pattern: " + (.input.pattern // "N/A") +
+                            if .input.path then " in " + .input.path else "" end
+                        elif .name == "Glob" then
+                            "Pattern: " + (.input.pattern // "N/A")
+                        else
+                            "Input: " + (.input | tostring)
+                        end
+                    elif .type == "tool_result" then
+                        "\n[TOOL RESULT]\n" +
+                        (if .content then
+                            (.content | if type == "array" then .[0].text else . end)
+                        else
+                            (.result // "No output")
+                        end)
+                    else
+                        ""
+                    end
+                ] | join("")
+            end
+        ) + "\n"
+    '
+}
+
+# Find conversation file by session ID (supports partial hash)
+find_conversation_file() {
+    local session_id="$1"
+
+    # Check if it's already a full path
+    if [ -f "$session_id" ]; then
+        echo "$session_id"
+        return 0
+    fi
+
+    # Try exact match first in current project directory
+    local current_dir=$(pwd | sed 's/\//-/g')
+    local project_dir="$CLAUDE_PROJECTS_DIR/$current_dir"
+
+    if [ -f "$project_dir/${session_id}.jsonl" ]; then
+        echo "$project_dir/${session_id}.jsonl"
+        return 0
+    fi
+
+    # Try exact match in all project directories
+    local found_file=$(find "$CLAUDE_PROJECTS_DIR" -name "${session_id}.jsonl" -type f | head -1)
+
+    if [ -n "$found_file" ]; then
+        echo "$found_file"
+        return 0
+    fi
+
+    # Try partial hash match (prefix matching)
+    local matches=$(find "$CLAUDE_PROJECTS_DIR" -name "${session_id}*.jsonl" ! -name "agent-*" -type f)
+    local match_count=$(echo "$matches" | grep -c "^" 2>/dev/null || echo 0)
+
+    if [ "$match_count" -eq 1 ]; then
+        echo "$matches"
+        return 0
+    elif [ "$match_count" -gt 1 ]; then
+        echo -e "${RED}Error: Ambiguous session ID '$session_id' - multiple matches found:${NC}" >&2
+        echo "$matches" | while read -r file; do
+            local full_id=$(basename "$file" .jsonl)
+            echo -e "  ${YELLOW}${full_id}${NC}" >&2
+        done
+        echo -e "${YELLOW}Tip: Use more characters to uniquely identify the session${NC}" >&2
+        return 1
+    fi
+
+    echo -e "${RED}Error: Session ID '$session_id' not found${NC}" >&2
+    echo -e "${YELLOW}Tip: Run 'claude-view-conversation -l' to see available conversations${NC}" >&2
+    return 1
+}
+
+# Main script
+main() {
+    local output_file=""
+    local session_id=""
+    local list_mode=false
+    local project_filter=""
+
+    # Parse arguments
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help)
+                show_help
+                exit 0
+                ;;
+            -l)
+                list_mode=true
+                shift
+                ;;
+            -p)
+                project_filter="$2"
+                shift 2
+                ;;
+            -o)
+                output_file="$2"
+                shift 2
+                ;;
+            -*)
+                echo -e "${RED}Error: Unknown option: $1${NC}" >&2
+                show_help
+                exit 1
+                ;;
+            *)
+                session_id="$1"
+                shift
+                ;;
+        esac
+    done
+
+    # List mode
+    if [ "$list_mode" = true ]; then
+        list_conversations "$project_filter"
+        exit 0
+    fi
+
+    # Need a session ID
+    if [ -z "$session_id" ]; then
+        echo -e "${RED}Error: No session ID or file specified${NC}" >&2
+        echo ""
+        show_help
+        exit 1
+    fi
+
+    # Find the conversation file
+    local conv_file
+    conv_file=$(find_conversation_file "$session_id") || exit 1
+
+    echo -e "${GREEN}Reading conversation:${NC} $conv_file" >&2
+    echo ""
+
+    # Extract and display/save
+    if [ -n "$output_file" ]; then
+        extract_conversation "$conv_file" > "$output_file"
+        echo -e "${GREEN}Saved to:${NC} $output_file" >&2
+        echo -e "${BLUE}Size:${NC} $(du -h "$output_file" | cut -f1)" >&2
+    else
+        extract_conversation "$conv_file" | less -R
+    fi
+}
+
+main "$@"
