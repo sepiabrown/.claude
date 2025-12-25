@@ -25,6 +25,8 @@ ${YELLOW}Options:${NC}
     -o FILE          Save output to FILE instead of viewing in less
     -l               List all available conversations
     -p PROJECT       Filter conversations by project directory
+    -r, --show-responses   Show ASSISTANT responses (hidden by default, only USER shown)
+    -a, --show-all   Show all messages including technical/system messages (hidden by default)
     -h, --help       Show this help message
 
 ${YELLOW}Examples:${NC}
@@ -75,10 +77,15 @@ list_conversations() {
             local short_id="${session_id:0:8}"
             local size=$(du -h "$file" | cut -f1)
             local timestamp=$(stat -c "%y" "$file" 2>/dev/null | cut -d'.' -f1 || stat -f "%Sm" -t "%Y-%m-%d %H:%M:%S" "$file" 2>/dev/null || echo "unknown")
-            local msg_count=$(wc -l < "$file")
+            local msg_count=$(cat "$file" | jq -r 'select(.type != "file-history-snapshot")' 2>/dev/null | wc -l)
+
+            # Skip sessions with 0 messages
+            if [ "$msg_count" -eq 0 ]; then
+                continue
+            fi
 
             # Extract first user message as title (skip meta and command messages)
-            local title=$(cat "$file" | jq -r 'select(.type == "user" and (.isMeta | not)) | .message.content | if type == "string" then . else empty end' 2>/dev/null | head -1 | cut -c1-80)
+            local title=$(cat "$file" | jq -r 'select(.type == "user" and (.isMeta | not)) | .message.content | if type == "string" then . elif type == "array" then ([.[] | select(.type == "text") | .text] | join(" ")) else empty end' 2>/dev/null | head -1 | cut -c1-80)
 
             # Clean up title (remove newlines and extra spaces)
             title=$(echo "$title" | tr '\n' ' ' | sed 's/  */ /g' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
@@ -98,16 +105,55 @@ list_conversations() {
 # Extract conversation text with tool calls
 extract_conversation() {
     local input_file="$1"
+    local show_tool_results="${2:-false}"
+    local show_responses="${3:-false}"
 
     if [ ! -f "$input_file" ]; then
         echo -e "${RED}Error: File not found: $input_file${NC}" >&2
         return 1
     fi
 
-    cat "$input_file" | jq -r '
-        select(.type == "user" or .type == "assistant") |
+    cat "$input_file" | jq -r --arg show_tool_results "$show_tool_results" --arg show_responses "$show_responses" '
+        select(.type == "user" or (.type == "assistant" and $show_responses == "true")) |
         select(.isMeta | not) |
-        "\n" + ("="*80) + "\n " + (.type | ascii_upcase) +
+        # Filter out USER messages with technical/system content unless --show-all is used
+        select(
+            if .type == "user" and $show_tool_results == "false" then
+                # Check if message contains tool results or starts with technical markers
+                if (.message.content | type) == "array" then
+                    # Array content: check for tool_result blocks or text starting with technical markers
+                    (
+                        (.message.content | any(.type == "tool_result")) or
+                        (.message.content | any(.type == "text" and (
+                            (.text | startswith("[TOOL RESULT]")) or
+                            (.text | startswith("<local-command-stdout>")) or
+                            (.text | startswith("<command-message>")) or
+                            (.text | startswith("<command-name>")) or
+                            (.text | startswith("This session is being continued from a previous conversation that ran out of context."))
+                        )))
+                    ) | not
+                elif (.message.content | type) == "string" then
+                    # String content: check if it starts with technical markers
+                    (
+                        (.message.content | startswith("[TOOL RESULT]")) or
+                        (.message.content | startswith("<local-command-stdout>")) or
+                        (.message.content | startswith("<command-message>")) or
+                        (.message.content | startswith("<command-name>")) or
+                        (.message.content | startswith("This session is being continued from a previous conversation that ran out of context."))
+                    ) | not
+                else
+                    true
+                end
+            else
+                true
+            end
+        ) |
+        "\n" + ("="*80) + "\n " + (.type | ascii_upcase) + " - " +
+        (if (.timestamp // .createdAt) then
+            ((.timestamp // .createdAt) | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601 + 32400 | strftime("%Y-%m-%d %H:%M:%S KST"))
+        else
+            "unknown timestamp"
+        end) +
         "\n" + ("="*80) + "\n" +
         (
             if (.message.content | type) == "string" then
@@ -210,6 +256,8 @@ main() {
     local session_id=""
     local list_mode=false
     local project_filter=""
+    local show_tool_results=false
+    local show_responses=false
 
     # Parse arguments
     while [ $# -gt 0 ]; do
@@ -229,6 +277,14 @@ main() {
             -o)
                 output_file="$2"
                 shift 2
+                ;;
+            -r|--show-responses)
+                show_responses=true
+                shift
+                ;;
+            -a|--show-all)
+                show_tool_results=true
+                shift
                 ;;
             -*)
                 echo -e "${RED}Error: Unknown option: $1${NC}" >&2
@@ -265,11 +321,11 @@ main() {
 
     # Extract and display/save
     if [ -n "$output_file" ]; then
-        extract_conversation "$conv_file" > "$output_file"
+        extract_conversation "$conv_file" "$show_tool_results" "$show_responses" > "$output_file"
         echo -e "${GREEN}Saved to:${NC} $output_file" >&2
         echo -e "${BLUE}Size:${NC} $(du -h "$output_file" | cut -f1)" >&2
     else
-        extract_conversation "$conv_file" | less -R
+        extract_conversation "$conv_file" "$show_tool_results" "$show_responses" | less -R
     fi
 }
 

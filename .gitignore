@@ -26,3 +26,5 @@ projects/
 
 # Statistics and telemetry
 statsig/
+
+stats-cache.json
